@@ -453,15 +453,7 @@ def read_wav_builtin(file_path: str) -> Tuple[np.ndarray, int]:
 
 
 def read_wav(file_path: str) -> Tuple[np.ndarray, int]:
-    try:
-        import torchaudio
-
-        waveform, sample_rate = torchaudio.load(file_path)
-        audio = waveform.detach().cpu().numpy()
-        audio = np.mean(audio, axis=0) if audio.ndim == 2 else audio
-        return np.nan_to_num(audio.astype(np.float32)), int(sample_rate)
-    except Exception:
-        return read_wav_builtin(file_path)
+    return read_wav_builtin(file_path)
 
 
 def resample_linear(audio: np.ndarray, original_sr: int, target_sr: int) -> np.ndarray:
@@ -489,6 +481,8 @@ def load_silero_vad():
         import torch
     except ImportError as exc:
         raise RuntimeError("Torch is required for Silero VAD. Install torch.") from exc
+
+    torch.set_num_threads(1)
 
     try:
         model, utils = torch.hub.load(
@@ -2875,7 +2869,7 @@ def render_results(
             )
             c5.metric("Natural Feel Pass", naturalness_pass)
 
-            st.dataframe(frontend_df(summary_df), use_container_width=True)
+            st.dataframe(frontend_df(summary_df), width="stretch")
             render_download_button(
                 "Download Summary CSV",
                 summary_df,
@@ -2896,7 +2890,7 @@ def render_results(
         )
 
         if not audio_df.empty:
-            st.dataframe(frontend_df(audio_df), use_container_width=True)
+            st.dataframe(frontend_df(audio_df), width="stretch")
             render_download_button("Download Audio QC CSV", audio_df, "audio_qc_all_wavs.csv")
         else:
             st.info("No WAV files found.")
@@ -2905,7 +2899,7 @@ def render_results(
         if not density_df.empty:
             st.dataframe(
                 frontend_df(density_df),
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "speaker": st.column_config.TextColumn("Speaker"),
                     "speaking_time": st.column_config.TextColumn("Speaking Time (mm:ss)"),
@@ -2947,10 +2941,10 @@ def render_results(
                 "four_plus_speaker_overlap_min",
             ]
             existing_cols = [col for col in overlap_summary_cols if col in transcript_df.columns]
-            st.dataframe(transcript_df[existing_cols], use_container_width=True)
+            st.dataframe(transcript_df[existing_cols], width="stretch")
 
         if not overlap_df.empty:
-            st.dataframe(frontend_df(overlap_df), use_container_width=True)
+            st.dataframe(frontend_df(overlap_df), width="stretch")
             render_download_button(
                 "Download Overlap Details CSV",
                 overlap_df,
@@ -2984,13 +2978,13 @@ Good conversational data should sound spontaneous: people naturally take turns, 
 
         if not transcript_df.empty:
             existing_cols = [col for col in cadence_cols if col in transcript_df.columns]
-            st.dataframe(frontend_df(transcript_df[existing_cols]), use_container_width=True)
+            st.dataframe(frontend_df(transcript_df[existing_cols]), width="stretch")
         else:
             st.info("Cadence details are shown after transcript processing.")
 
     with tab_monologues:
         if not monologues_df.empty:
-            st.dataframe(frontend_df(monologues_df), use_container_width=True)
+            st.dataframe(frontend_df(monologues_df), width="stretch")
             render_download_button(
                 "Download Monologues CSV",
                 monologues_df,
@@ -3023,10 +3017,10 @@ Good conversational data should sound spontaneous: people naturally take turns, 
 
         if not transcript_df.empty:
             existing_cols = [col for col in naturalness_summary_cols if col in transcript_df.columns]
-            st.dataframe(frontend_df(transcript_df[existing_cols]), use_container_width=True)
+            st.dataframe(frontend_df(transcript_df[existing_cols]), width="stretch")
 
         if not naturalness_df.empty:
-            st.dataframe(frontend_df(naturalness_df), use_container_width=True)
+            st.dataframe(frontend_df(naturalness_df), width="stretch")
             render_download_button(
                 "Download Naturalness CSV",
                 naturalness_df,
@@ -3037,7 +3031,7 @@ Good conversational data should sound spontaneous: people naturally take turns, 
 
     if not errors_df.empty:
         with st.expander("Processing messages", expanded=True):
-            st.dataframe(frontend_df(errors_df), use_container_width=True)
+            st.dataframe(frontend_df(errors_df), width="stretch")
             render_download_button("Download Errors CSV", errors_df, "qc_errors.csv")
 
 
@@ -3058,7 +3052,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         drive_link = st.text_input("Google Drive folder or file link")
-        run_clicked = st.button("Run QC", type="primary", use_container_width=True)
+        run_clicked = st.button("Run QC", type="primary", width="stretch")
 
         if run_clicked:
             if not drive_link.strip():
@@ -3121,7 +3115,7 @@ def main() -> None:
 
         st.subheader("Detected Inputs")
         pairing_preview = build_pairing_preview(pairs)
-        st.dataframe(pairing_preview, use_container_width=True)
+        st.dataframe(pairing_preview, width="stretch")
 
         (
             audio_df,
