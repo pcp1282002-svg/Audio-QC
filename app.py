@@ -25,11 +25,6 @@ from __future__ import annotations
 import json
 import math
 import os
-
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-
 import re
 import tempfile
 import wave
@@ -59,7 +54,6 @@ DRIVE_REQUEST_TIMEOUT_SECONDS = 60
 RIVERSIDE_WORDS_PER_SECOND = 2.7
 RIVERSIDE_MAX_INFERRED_OVERLAP_TAIL_SECONDS = 0.75
 NATURALNESS_PASS_SCORE = 75
-SILERO_MODEL_FILE = "silero_vad.jit"
 FRONTEND_HIDDEN_COLUMNS = {
     "conversation_key",
     "_speech_intervals_vad",
@@ -459,7 +453,15 @@ def read_wav_builtin(file_path: str) -> Tuple[np.ndarray, int]:
 
 
 def read_wav(file_path: str) -> Tuple[np.ndarray, int]:
-    return read_wav_builtin(file_path)
+    try:
+        import torchaudio
+
+        waveform, sample_rate = torchaudio.load(file_path)
+        audio = waveform.detach().cpu().numpy()
+        audio = np.mean(audio, axis=0) if audio.ndim == 2 else audio
+        return np.nan_to_num(audio.astype(np.float32)), int(sample_rate)
+    except Exception:
+        return read_wav_builtin(file_path)
 
 
 def resample_linear(audio: np.ndarray, original_sr: int, target_sr: int) -> np.ndarray:
@@ -481,168 +483,6 @@ def resample_linear(audio: np.ndarray, original_sr: int, target_sr: int) -> np.n
     return np.interp(new_x, old_x, audio).astype(np.float32)
 
 
-def get_silero_asset_path(file_name: str) -> Path:
-    return Path(__file__).resolve().parent / "silero_assets" / file_name
-
-
-def get_speech_timestamps_local(
-    audio,
-    model,
-    threshold: float = 0.5,
-    sampling_rate: int = 16000,
-    min_speech_duration_ms: int = 250,
-    max_speech_duration_s: float = float("inf"),
-    min_silence_duration_ms: int = 100,
-    speech_pad_ms: int = 30,
-    return_seconds: bool = False,
-    time_resolution: int = 1,
-    neg_threshold: Optional[float] = None,
-    **_,
-):
-    import torch
-
-    if not torch.is_tensor(audio):
-        audio = torch.Tensor(audio)
-
-    if len(audio.shape) > 1:
-        for _ in range(len(audio.shape)):
-            audio = audio.squeeze(0)
-        if len(audio.shape) > 1:
-            raise ValueError("Silero VAD expects mono audio")
-
-    if sampling_rate not in (8000, 16000):
-        raise ValueError("Silero VAD supports only 8000 Hz and 16000 Hz audio")
-
-    window_size_samples = 512 if sampling_rate == 16000 else 256
-    model.reset_states()
-
-    min_speech_samples = sampling_rate * min_speech_duration_ms / 1000
-    speech_pad_samples = sampling_rate * speech_pad_ms / 1000
-    max_speech_samples = (
-        sampling_rate * max_speech_duration_s
-        - window_size_samples
-        - 2 * speech_pad_samples
-    )
-    min_silence_samples = sampling_rate * min_silence_duration_ms / 1000
-    min_silence_samples_at_max_speech = sampling_rate * 98 / 1000
-    audio_length_samples = len(audio)
-
-    speech_probs = []
-    with torch.no_grad():
-        for current_start_sample in range(0, audio_length_samples, window_size_samples):
-            chunk = audio[current_start_sample : current_start_sample + window_size_samples]
-            if len(chunk) < window_size_samples:
-                chunk = torch.nn.functional.pad(
-                    chunk,
-                    (0, int(window_size_samples - len(chunk))),
-                )
-            speech_probs.append(model(chunk, sampling_rate).item())
-
-    triggered = False
-    speeches = []
-    current_speech = {}
-    neg_threshold = max(threshold - 0.15, 0.01) if neg_threshold is None else neg_threshold
-    temp_end = 0
-    prev_end = 0
-    next_start = 0
-    possible_ends = []
-
-    for index, speech_prob in enumerate(speech_probs):
-        cur_sample = window_size_samples * index
-
-        if speech_prob >= threshold and temp_end:
-            sil_dur = cur_sample - temp_end
-            if sil_dur > min_silence_samples_at_max_speech:
-                possible_ends.append((temp_end, sil_dur))
-            temp_end = 0
-            if next_start < prev_end:
-                next_start = cur_sample
-
-        if speech_prob >= threshold and not triggered:
-            triggered = True
-            current_speech["start"] = cur_sample
-            continue
-
-        if triggered and cur_sample - current_speech["start"] > max_speech_samples:
-            if possible_ends:
-                prev_end, dur = max(possible_ends, key=lambda item: item[1])
-                current_speech["end"] = prev_end
-                speeches.append(current_speech)
-                current_speech = {}
-                next_start = prev_end + dur
-
-                if next_start < prev_end + cur_sample:
-                    current_speech["start"] = next_start
-                else:
-                    triggered = False
-
-                prev_end = 0
-                next_start = 0
-                temp_end = 0
-                possible_ends = []
-            else:
-                current_speech["end"] = cur_sample
-                speeches.append(current_speech)
-                current_speech = {}
-                prev_end = 0
-                next_start = 0
-                temp_end = 0
-                triggered = False
-                possible_ends = []
-                continue
-
-        if speech_prob < neg_threshold and triggered:
-            if not temp_end:
-                temp_end = cur_sample
-
-            if cur_sample - temp_end < min_silence_samples:
-                continue
-
-            current_speech["end"] = temp_end
-            if current_speech["end"] - current_speech["start"] > min_speech_samples:
-                speeches.append(current_speech)
-            current_speech = {}
-            prev_end = 0
-            next_start = 0
-            temp_end = 0
-            triggered = False
-            possible_ends = []
-
-    if current_speech and audio_length_samples - current_speech["start"] > min_speech_samples:
-        current_speech["end"] = audio_length_samples
-        speeches.append(current_speech)
-
-    for index, speech in enumerate(speeches):
-        if index == 0:
-            speech["start"] = int(max(0, speech["start"] - speech_pad_samples))
-
-        if index != len(speeches) - 1:
-            silence_duration = speeches[index + 1]["start"] - speech["end"]
-            if silence_duration < 2 * speech_pad_samples:
-                speech["end"] += int(silence_duration // 2)
-                speeches[index + 1]["start"] = int(
-                    max(0, speeches[index + 1]["start"] - silence_duration // 2)
-                )
-            else:
-                speech["end"] = int(min(audio_length_samples, speech["end"] + speech_pad_samples))
-                speeches[index + 1]["start"] = int(
-                    max(0, speeches[index + 1]["start"] - speech_pad_samples)
-                )
-        else:
-            speech["end"] = int(min(audio_length_samples, speech["end"] + speech_pad_samples))
-
-    if return_seconds:
-        audio_length_seconds = audio_length_samples / sampling_rate
-        for speech in speeches:
-            speech["start"] = max(round(speech["start"] / sampling_rate, time_resolution), 0)
-            speech["end"] = min(
-                round(speech["end"] / sampling_rate, time_resolution),
-                audio_length_seconds,
-            )
-
-    return speeches
-
-
 @st.cache_resource(show_spinner=False)
 def load_silero_vad():
     try:
@@ -650,15 +490,22 @@ def load_silero_vad():
     except ImportError as exc:
         raise RuntimeError("Torch is required for Silero VAD. Install torch.") from exc
 
-    torch.set_num_threads(1)
-    model_path = get_silero_asset_path(SILERO_MODEL_FILE)
+    try:
+        model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            trust_repo=True,
+        )
+    except TypeError:
+        model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+        )
 
-    if not model_path.exists():
-        raise FileNotFoundError(f"Missing Silero VAD model file: {model_path}")
-
-    model = torch.jit.load(str(model_path), map_location=torch.device("cpu"))
-    model.eval()
-    return model, get_speech_timestamps_local
+    get_speech_timestamps = utils[0]
+    return model, get_speech_timestamps
 
 
 def build_speech_mask_from_seconds(
@@ -1000,20 +847,32 @@ def download_from_drive(
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 file_name = Path(drive_file.path).name
                 update_status(f"Downloading {index}/{total_files}: {file_name}")
-                if progress_callback:
-                    progress_callback(index, total_files, file_name, 0, 1)
+
+                def progress(
+                    bytes_downloaded,
+                    total_size,
+                    current_index=index,
+                    current_file=file_name,
+                ):
+                    if progress_callback:
+                        progress_callback(
+                            current_index,
+                            total_files,
+                            current_file,
+                            bytes_downloaded,
+                            total_size,
+                        )
 
                 downloaded_path = gdown.download(
                     id=drive_file.id,
                     output=local_path,
                     quiet=True,
                     use_cookies=False,
+                    progress=progress,
                 )
 
                 if downloaded_path:
                     downloaded_paths.append(downloaded_path)
-                    if progress_callback:
-                        progress_callback(index, total_files, file_name, 1, 1)
 
             update_status("Google Drive download completed.")
             return collect_supported_files(output_dir)
@@ -1024,19 +883,20 @@ def download_from_drive(
             raise ValueError("Invalid Google Drive link")
 
         update_status("Downloading Google Drive file...")
-        if progress_callback:
-            progress_callback(1, 1, "Drive file", 0, 1)
+
+        def progress(bytes_downloaded, total_size):
+            if progress_callback:
+                progress_callback(1, 1, "Drive file", bytes_downloaded, total_size)
 
         downloaded_path = gdown.download(
             id=file_id,
             output=output_dir + os.sep,
             quiet=True,
             use_cookies=False,
+            progress=progress,
         )
 
         if downloaded_path and Path(downloaded_path).suffix.lower() in SUPPORTED_EXTENSIONS:
-            if progress_callback:
-                progress_callback(1, 1, Path(downloaded_path).name, 1, 1)
             return [downloaded_path]
 
     return collect_supported_files(output_dir)
@@ -3015,7 +2875,7 @@ def render_results(
             )
             c5.metric("Natural Feel Pass", naturalness_pass)
 
-            st.dataframe(frontend_df(summary_df), width="stretch")
+            st.dataframe(frontend_df(summary_df), use_container_width=True)
             render_download_button(
                 "Download Summary CSV",
                 summary_df,
@@ -3036,7 +2896,7 @@ def render_results(
         )
 
         if not audio_df.empty:
-            st.dataframe(frontend_df(audio_df), width="stretch")
+            st.dataframe(frontend_df(audio_df), use_container_width=True)
             render_download_button("Download Audio QC CSV", audio_df, "audio_qc_all_wavs.csv")
         else:
             st.info("No WAV files found.")
@@ -3045,7 +2905,7 @@ def render_results(
         if not density_df.empty:
             st.dataframe(
                 frontend_df(density_df),
-                width="stretch",
+                use_container_width=True,
                 column_config={
                     "speaker": st.column_config.TextColumn("Speaker"),
                     "speaking_time": st.column_config.TextColumn("Speaking Time (mm:ss)"),
@@ -3087,10 +2947,10 @@ def render_results(
                 "four_plus_speaker_overlap_min",
             ]
             existing_cols = [col for col in overlap_summary_cols if col in transcript_df.columns]
-            st.dataframe(transcript_df[existing_cols], width="stretch")
+            st.dataframe(transcript_df[existing_cols], use_container_width=True)
 
         if not overlap_df.empty:
-            st.dataframe(frontend_df(overlap_df), width="stretch")
+            st.dataframe(frontend_df(overlap_df), use_container_width=True)
             render_download_button(
                 "Download Overlap Details CSV",
                 overlap_df,
@@ -3124,13 +2984,13 @@ Good conversational data should sound spontaneous: people naturally take turns, 
 
         if not transcript_df.empty:
             existing_cols = [col for col in cadence_cols if col in transcript_df.columns]
-            st.dataframe(frontend_df(transcript_df[existing_cols]), width="stretch")
+            st.dataframe(frontend_df(transcript_df[existing_cols]), use_container_width=True)
         else:
             st.info("Cadence details are shown after transcript processing.")
 
     with tab_monologues:
         if not monologues_df.empty:
-            st.dataframe(frontend_df(monologues_df), width="stretch")
+            st.dataframe(frontend_df(monologues_df), use_container_width=True)
             render_download_button(
                 "Download Monologues CSV",
                 monologues_df,
@@ -3163,10 +3023,10 @@ Good conversational data should sound spontaneous: people naturally take turns, 
 
         if not transcript_df.empty:
             existing_cols = [col for col in naturalness_summary_cols if col in transcript_df.columns]
-            st.dataframe(frontend_df(transcript_df[existing_cols]), width="stretch")
+            st.dataframe(frontend_df(transcript_df[existing_cols]), use_container_width=True)
 
         if not naturalness_df.empty:
-            st.dataframe(frontend_df(naturalness_df), width="stretch")
+            st.dataframe(frontend_df(naturalness_df), use_container_width=True)
             render_download_button(
                 "Download Naturalness CSV",
                 naturalness_df,
@@ -3177,7 +3037,7 @@ Good conversational data should sound spontaneous: people naturally take turns, 
 
     if not errors_df.empty:
         with st.expander("Processing messages", expanded=True):
-            st.dataframe(frontend_df(errors_df), width="stretch")
+            st.dataframe(frontend_df(errors_df), use_container_width=True)
             render_download_button("Download Errors CSV", errors_df, "qc_errors.csv")
 
 
@@ -3198,7 +3058,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         drive_link = st.text_input("Google Drive folder or file link")
-        run_clicked = st.button("Run QC", type="primary", width="stretch")
+        run_clicked = st.button("Run QC", type="primary", use_container_width=True)
 
         if run_clicked:
             if not drive_link.strip():
@@ -3261,7 +3121,7 @@ def main() -> None:
 
         st.subheader("Detected Inputs")
         pairing_preview = build_pairing_preview(pairs)
-        st.dataframe(pairing_preview, width="stretch")
+        st.dataframe(pairing_preview, use_container_width=True)
 
         (
             audio_df,
